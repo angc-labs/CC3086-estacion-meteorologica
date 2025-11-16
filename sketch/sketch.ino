@@ -14,21 +14,19 @@ PROGRAMACION DE MICROPROCESADORES
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
 
-char ssid[] = "";
-char pass[] = "";
-const char* server = "";
-const char* key    = "";
+char ssid[] = "Red piso 1";
+char pass[] = "Di.mi.nombre.64";
+const String server = "https://cc-3086-estacion-meteorologica-back.vercel.app/api";
 
 // ---------------- PINES ----------------
-#define PIN_DHT      14   // D5
-#define DHTTYPE      DHT11
-#define FC37_PIN     12   // D6
-#define MQ3_PIN      A0
-#define BUTTON_PIN   13   // D7
-#define BUZZER_PIN   15   // D8
-#define SERVO_PIN    2    // D4
+#define PIN_DHT 14   // D5
+#define DHTTYPE DHT11
+#define FC37_PIN 12   // D6
+#define MQ3_PIN A0
+#define BUTTON_PIN 13   // D7
+#define BUZZER_PIN 15   // D8
+#define SERVO_PIN 2    // D4
 
-// ---------------- OBJETOS ----------------
 BH1750 lightMeter;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Adafruit_BMP280 bmp;
@@ -37,12 +35,12 @@ Servo gateServo;
 
 // ---------------- TIMERS ----------------
 unsigned long lastSend = 0;
-const unsigned long interval = 10000; // cada 10 s
+const unsigned long interval = 20000; // cada 10 s
 
 unsigned long lastLCD = 0;
 int lcdPage = 0;
 
-// ---------------- MQ3 Coeficientes ----------------
+// ---------------- MQ3  ----------------
 float m_alcohol = -0.60, b_alcohol = 1.70;
 float m_H2 = -0.35, b_H2 = 0.25;
 float m_CO = -0.50, b_CO = 0.10;
@@ -78,6 +76,65 @@ void readMQ3Gases(float &ppm_alc, float &ppm_H2, float &ppm_CO,
   ppm_CH4  = MQ3_PPM(ratio, m_CH4, b_CH4);
 }
 
+String getRemoteState() {
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.begin(client, server+"/state");
+
+  int code = http.GET();
+  if (code != 200) return "";
+
+  return http.getString();
+}
+
+
+void updateFromServer(bool &estadoRemoto) {
+  String json = getRemoteState();
+  if (json.length() == 0) return;
+
+  bool open = json.indexOf("\"open\":true") > 0;
+  estadoRemoto = open;
+
+  int textStart = json.indexOf("\"text\":\"") + 8;
+  int textEnd = json.indexOf("\"", textStart);
+  String text = json.substring(textStart, textEnd);
+
+  lcd.clear();
+  lcd.print(text);
+
+  gateServo.write(open ? 180 : 0);
+  digitalWrite(BUZZER_PIN, open ? HIGH : LOW);
+}
+
+void updateRemoteState(bool open, String textMsg) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.begin(client, String(server) + "/state");
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{";
+  json += "\"open\":" + String(open ? "true" : "false") + ",";
+  json += "\"text\":\"" + textMsg + "\"";
+  json += "}";
+
+  Serial.println("Enviando estado al servidor:");
+  Serial.println(json);
+
+  int code = http.POST(json);
+  Serial.print("Estado actualizado, HTTP: ");
+  Serial.println(code);
+
+  http.end();
+}
+
 void sendSupabase(
   float ppm_alcohol, float ppm_H2, float ppm_CO,
   float ppm_propano, float ppm_CH4,
@@ -94,9 +151,8 @@ void sendSupabase(
   client.setInsecure();
 
   HTTPClient http;
-  http.begin(client, server);
+  http.begin(client, server+"/readings");
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(key));
 
   String jsonData = "{";
   jsonData += "\"ppm_alcohol\":" + String(safeFloat(ppm_alcohol)) + ",";
@@ -158,7 +214,26 @@ void setup() {
 
 
 void loop() {
-  bool abierto = !!(digitalRead(BUTTON_PIN) == LOW);
+  static bool ultimoEstado = false;
+  static bool estadoRemoto = false;
+  
+  bool botonPresionado = (digitalRead(BUTTON_PIN) == LOW);
+  
+  // Si el botón cambia de estado, actualizar el servidor
+  if (botonPresionado != ultimoEstado) {
+    ultimoEstado = botonPresionado;
+    estadoRemoto = botonPresionado;
+
+    String msg = botonPresionado ? "Puerta abierta" : "Puerta cerrada";
+    updateRemoteState(botonPresionado, msg);
+    
+    // Actualizar servo y buzzer inmediatamente
+    gateServo.write(botonPresionado ? 180 : 0);
+    digitalWrite(BUZZER_PIN, botonPresionado ? HIGH : LOW);
+  } else {
+    // Si no hay cambio local, consultar el estado remoto
+    updateFromServer(estadoRemoto);
+  }
 
   // ----- MQ-3 -----
   float ppm_alcohol, ppm_H2, ppm_CO, ppm_propano, ppm_CH4;
@@ -171,15 +246,6 @@ void loop() {
   float hum  = dht.readHumidity();
   float tempDHT = dht.readTemperature();
   int lluvia = digitalRead(FC37_PIN);   // 0 = mojado
-
-  // ---------- SERVO + BUZZER -----------
-  if (abierto) {
-    gateServo.write(180);
-    digitalWrite(BUZZER_PIN, HIGH);
-  } else {
-    gateServo.write(0);
-    digitalWrite(BUZZER_PIN, LOW);
-  }
 
   if (millis() - lastLCD >= 2000) {
     lastLCD = millis();
@@ -242,9 +308,9 @@ void loop() {
     sendSupabase(
       ppm_alcohol, ppm_H2, ppm_CO, ppm_propano, ppm_CH4,
       lux, tempBMP, pres, alt,
-      hum, tempDHT, lluvia, abierto
+      hum, tempDHT, lluvia, estadoRemoto
     );
-
+    
     Serial.println("Datos enviados!");
   }
 }

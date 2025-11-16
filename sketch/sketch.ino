@@ -14,8 +14,8 @@ PROGRAMACION DE MICROPROCESADORES
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
 
-char ssid[] = "Red piso 1";
-char pass[] = "Di.mi.nombre.64";
+char ssid[] = "";
+char pass[] = "";
 const String server = "https://cc-3086-estacion-meteorologica-back.vercel.app/api";
 
 // ---------------- PINES ----------------
@@ -313,4 +313,5 @@ void loop() {
     
     Serial.println("Datos enviados!");
   }
+
 }

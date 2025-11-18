@@ -1,6 +1,7 @@
 /*
 UNIVERSIDAD DEL VALLE DE GUATEMALA
 PROGRAMACION DE MICROPROCESADORES
+Estación Meteorológica con Geolocalización WiFi
 */
 
 #include <Wire.h>
@@ -13,10 +14,16 @@ PROGRAMACION DE MICROPROCESADORES
 #include <ESP8266WiFi.h>  
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 
-char ssid[] = "";
-char pass[] = "";
+char ssid[] = "Saritah";
+char pass[] = "guate2000.@@";
 const String server = "https://cc-3086-estacion-meteorologica-back.vercel.app/api";
+
+// Google Geolocation API
+const char* googleHost = "www.googleapis.com";
+const String geoEndpoint = "/geolocation/v1/geolocate?key=";
+const String apiKey = "AIzaSyAbGG-Gg66vr_BqLRnElDW97G_wGyHzE1M";
 
 // ---------------- PINES ----------------
 #define PIN_DHT 14   // D5
@@ -35,10 +42,21 @@ Servo gateServo;
 
 // ---------------- TIMERS ----------------
 unsigned long lastSend = 0;
-const unsigned long interval = 20000; // cada 10 s
+const unsigned long interval = 3000; // cada 3 segundos (sincronizado con geolocalización)
 
 unsigned long lastLCD = 0;
 int lcdPage = 0;
+
+// ---------------- VARIABLES DE GEOLOCALIZACIÓN ----------------
+double currentLatitude = 0.0;
+double currentLongitude = 0.0;
+double currentAccuracy = 0.0;
+bool geoDataAvailable = false;
+
+// Variables para mantener la última ubicación válida
+double lastValidLatitude = 0.0;
+double lastValidLongitude = 0.0;
+double lastValidAccuracy = 0.0;
 
 // ---------------- MQ3  ----------------
 float m_alcohol = -0.60, b_alcohol = 1.70;
@@ -76,6 +94,117 @@ void readMQ3Gases(float &ppm_alc, float &ppm_H2, float &ppm_CO,
   ppm_CH4  = MQ3_PPM(ratio, m_CH4, b_CH4);
 }
 
+// ---------------- FUNCIÓN DE GEOLOCALIZACIÓN ----------------
+bool updateGeolocation() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi no conectado para geolocalización");
+    return false;
+  }
+
+  Serial.println("🔎 Escaneando redes WiFi para geolocalización...");
+  int n = WiFi.scanNetworks();
+
+  if (n < 2) {
+    Serial.println("⚠️ No se encontraron suficientes redes para geolocalización.");
+    return false;
+  }
+
+  Serial.print("📶 Redes detectadas: ");
+  Serial.println(n);
+
+  DynamicJsonDocument doc(2048);
+  
+  JsonArray wifiAccessPoints = doc.createNestedArray("wifiAccessPoints");
+  for (int j = 0; j < n; ++j) {
+    JsonObject wifiObject = wifiAccessPoints.createNestedObject();
+    wifiObject["macAddress"] = WiFi.BSSIDstr(j);
+    wifiObject["signalStrength"] = WiFi.RSSI(j);
+  }
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  Serial.println("📦 JSON enviado a Google:");
+  Serial.println(jsonString);
+
+  // Conexión HTTPS
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  Serial.println("🌐 Conectando a Google Geolocation API...");
+  if (!client.connect(googleHost, 443)) {
+    Serial.println("❌ Error al conectar con Google API.");
+    return false;
+  }
+
+  // Petición POST
+  String fullEndpoint = geoEndpoint + apiKey;
+  client.println("POST " + fullEndpoint + " HTTP/1.1");
+  client.println("Host: " + String(googleHost));
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println(jsonString.length());
+  client.println();
+  client.print(jsonString);
+
+  // Espera de respuesta
+  String response = "";
+  unsigned long timeout = millis();
+  while (!client.available()) {
+    if (millis() - timeout > 10000) {
+      Serial.println("⏳ Tiempo de espera agotado.");
+      client.stop();
+      return false;
+    }
+  }
+
+  // Lectura de la respuesta
+  response = client.readString();
+  client.stop();
+
+  // Obteniendo el JSON
+  int jsonStart = response.indexOf('{');
+  if (jsonStart == -1) {
+    Serial.println("⚠️ No se encontró contenido JSON en la respuesta.");
+    return false;
+  }
+  String jsonPart = response.substring(jsonStart);
+
+  Serial.println("📄 Respuesta JSON de Google:");
+  Serial.println(jsonPart);
+
+  // Análisis del JSON
+  DynamicJsonDocument responseDoc(1024);
+  DeserializationError error = deserializeJson(responseDoc, jsonPart);
+
+  if (error) {
+    Serial.print("❌ Error al analizar JSON: ");
+    Serial.println(error.c_str());
+    return false;
+  } else {
+    if (responseDoc.containsKey("error")) {
+      String errorMessage = responseDoc["error"]["message"];
+      Serial.print("⚠️ La API de Google devolvió un error: ");
+      Serial.println(errorMessage);
+      return false;
+    } else {
+      currentLatitude = responseDoc["location"]["lat"];
+      currentLongitude = responseDoc["location"]["lng"];
+      currentAccuracy = responseDoc["accuracy"];
+      geoDataAvailable = true;
+
+      Serial.println();
+      Serial.println("📍 ¡Ubicación actualizada!");
+      Serial.print("🌎 Latitud:  "); Serial.println(currentLatitude, 6);
+      Serial.print("🌍 Longitud: "); Serial.println(currentLongitude, 6);
+      Serial.print("🎯 Precisión: "); Serial.print(currentAccuracy); Serial.println(" m");
+      Serial.println();
+      return true;
+    }
+  }
+  return false;
+}
+
 String getRemoteState() {
   if (WiFi.status() != WL_CONNECTED) return "";
 
@@ -90,7 +219,6 @@ String getRemoteState() {
 
   return http.getString();
 }
-
 
 void updateFromServer(bool &estadoRemoto) {
   String json = getRemoteState();
@@ -168,6 +296,10 @@ void sendSupabase(
   jsonData += "\"temp_dht\":" + String(safeFloat(tempDHT)) + ",";
   jsonData += "\"lluvia\":" + String(lluvia) + ",";
   jsonData += "\"open\":" + String(abierto);
+  jsonData += ",\"latitude\":" + String(geoDataAvailable ? currentLatitude : 0.0, 6);
+  jsonData += ",\"longitude\":" + String(geoDataAvailable ? currentLongitude : 0.0, 6);
+  jsonData += ",\"accuracy\":" + String(geoDataAvailable ? currentAccuracy : 0.0, 2);
+  
   jsonData += "}";
 
   Serial.println(jsonData);
@@ -178,7 +310,6 @@ void sendSupabase(
 
   http.end();
 }
-
 
 void setup() {
   Serial.begin(115200);
@@ -210,8 +341,13 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nWiFi conectado!");
+  Serial.print("Dirección IP: ");
+  Serial.println(WiFi.localIP());
+  
+  // Obtener ubicación inicial
+  delay(2000); // Esperar estabilización
+  updateGeolocation();
 }
-
 
 void loop() {
   static bool ultimoEstado = false;
@@ -295,23 +431,42 @@ void loop() {
         lcd.print("Alt:");
         lcd.print(alt);
         break;
+      
+      case 6:
+        if (geoDataAvailable) {
+          lcd.print("Lat:");
+          lcd.print(currentLatitude, 3);
+          lcd.setCursor(0,1);
+          lcd.print("Lon:");
+          lcd.print(currentLongitude, 3);
+        } else {
+          lcd.print("Ubicacion:");
+          lcd.setCursor(0,1);
+          lcd.print("No disponible");
+        }
+        break;
     }
 
-    lcdPage = (lcdPage + 1) % 6;
+    lcdPage = (lcdPage + 1) % 7;
   }
 
-  // ---------- TIMER SUPABASE ----------
+  // ---------- TIMER SINCRONIZADO: GEOLOCALIZACIÓN + ENVÍO DATOS ----------
   unsigned long now = millis();
   if (now - lastSend >= interval) {
     lastSend = now;
 
+    // Primero actualizar geolocalización
+    Serial.println("=== CICLO DE ACTUALIZACIÓN (cada 3s) ===");
+    updateGeolocation();
+    
+    // Luego enviar todos los datos incluyendo la ubicación actualizada
     sendSupabase(
       ppm_alcohol, ppm_H2, ppm_CO, ppm_propano, ppm_CH4,
       lux, tempBMP, pres, alt,
       hum, tempDHT, lluvia, estadoRemoto
     );
     
-    Serial.println("Datos enviados!");
+    Serial.println("✅ Datos enviados con ubicación!");
+    Serial.println("=====================================\n");
   }
-
 }
